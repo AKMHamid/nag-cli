@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# =============================================================================
+# nag ─ Minimal nagging terminal sticky note tool
+#
+#  • `nag add <msg>`   (alias `nag a`)     append a one-line reminder
+#  • `nag list`        (alias `nag l`)     show current reminders
+#  • `nag delete <kw>` (alias `nag d`)     delete all lines containing <kw>
+#  • `nag clear`       (alias `nag c`)     wipe the current reminder file
+#  • `nag mute`        (alias `nag m`)     hide reminders until re-activated
+#  • `nag activate`    (alias `nag act`)   un-mute
+#  • `nag undo`        (alias `nag u`)     revert last mutating action (3-level)
+#
+# Reminders live in ~/.reminders when in the active state, else ~/.reminders.muted
+# =============================================================================
+set -euo pipefail
+
+# -----------------------------------------------------------------------------#
+#  CONSTANTS
+# -----------------------------------------------------------------------------#
+BASHRC="$HOME/.bashrc"
+MARK="# >>> nag tool (terminal reminders) >>>"
+ENDMARK="# <<< nag tool (terminal reminders) <<<"
+REMINDER_FILE="$HOME/.reminders"
+
+# -----------------------------------------------------------------------------#
+#  SETUP  ─ install a hook into ~/.bashrc that prints reminders on every shell
+# -----------------------------------------------------------------------------#
+ensure_hook() {
+    # Only append once
+    grep -q "$MARK" "$BASHRC" || {
+        {
+            printf '\n%s\n' "$MARK"
+            printf '[ -f "%s" ] && cat "%s"\n'       "$REMINDER_FILE"        "$REMINDER_FILE"
+            printf '[ -f "%s.muted" ] && cat "%s.muted"\n' "$REMINDER_FILE" "$REMINDER_FILE"
+            printf '%s\n' "$ENDMARK"
+        } >> "$BASHRC"
+    }
+}
+
+# -----------------------------------------------------------------------------#
+#  Helpers
+# -----------------------------------------------------------------------------#
+print_state() { # show whether reminders are currently muted based on file existence
+    if [[ -f "${REMINDER_FILE}.muted" ]]; then
+        printf "State: 🔕\n\n"
+    else
+        printf "State: 🔔\n\n"
+    fi
+}
+
+# -----------------------------------------------------------------------------#
+#  BACKUP / UNDO  (timestamped *.bak, keep only most recent 3)
+# -----------------------------------------------------------------------------#
+backup_file() {
+    local src
+    [[ -f "${REMINDER_FILE}.muted" ]] && src="${REMINDER_FILE}.muted" || src="$REMINDER_FILE"
+    [[ -f $src ]] || return 0                       # nothing to back up yet
+
+    cp -p "$src" "${src}.$(date +%s).bak"           # portable -p keeps times
+
+    mapfile -t bak < <(ls -t "${src}".*.bak 2>/dev/null || true)   # newest→oldest
+    (( ${#bak[@]} > 3 )) && printf '%s\0' "${bak[@]:3}" |
+        xargs -0r rm -- 2>/dev/null || true          # prune extras, ignore errors
+}
+
+undo_last() {
+    local src bak
+    [[ -f "${REMINDER_FILE}.muted" ]] && src="${REMINDER_FILE}.muted" || src="$REMINDER_FILE"
+    bak=$(ls -t "${src}".*.bak 2>/dev/null | head -n1) || true
+    [[ -z $bak ]] && { echo "Nothing to undo."; return; }
+
+    cp "$bak" "$src"
+    rm -f "$bak"
+    echo "Undo done → restored $(basename "$bak")"
+}
+
+# -----------------------------------------------------------------------------#
+#  COMMAND IMPLEMENTATIONS
+# -----------------------------------------------------------------------------#
+add_reminder() {
+    backup_file
+    print_state
+    ensure_hook
+    shift
+
+    # Guard against empty reminders
+    [[ $# -eq 0 || -z "$*" ]] && { echo "Nothing to add."; return 1; }
+
+    new_line="🔔 Reminder: $*"
+    if [[ -f "${REMINDER_FILE}.muted" ]]; then
+        printf '%s\n' "$new_line" >> "${REMINDER_FILE}.muted"
+    else
+        printf '%s\n' "$new_line" >> "$REMINDER_FILE"
+    fi
+
+    # Confirmation
+    echo "Added:"
+    printf '%s\n' "$new_line"
+}
+
+list_reminders() {
+    print_state
+    [[ -f "${REMINDER_FILE}.muted" ]] && cat "${REMINDER_FILE}.muted" || cat "$REMINDER_FILE"
+}
+
+delete_reminder() {
+    backup_file
+    target="$REMINDER_FILE"; [[ -f "${REMINDER_FILE}.muted" ]] && target="${REMINDER_FILE}.muted"
+    print_state
+
+    keyword=$1
+    [[ -z $keyword ]] && { echo "Please provide a keyword."; return 1; }
+    # Fetch deleted reminders
+    deleted_lines=$(grep -F -- "$keyword" "$target" || true)
+    [[ -z $deleted_lines ]] && { echo "No matches for: $keyword"; return; }
+
+    # Unique temp
+    tmpfile=$(mktemp "${REMINDER_FILE}.XXXXXX")
+    if grep -vF -- "$keyword" "$target" > "$tmpfile"; then : ;
+    elif [[ $? -eq 1 ]]; then : ; else echo "grep error"; rm -f "$tmpfile"; return 1; fi
+
+    mv -- "$tmpfile" "$target"
+    # Confirmation
+    echo "Deleted:"; printf '%s\n' "$deleted_lines"
+}
+
+clear_reminders() {
+    backup_file
+    print_state
+    target="$REMINDER_FILE"; [[ -f "${REMINDER_FILE}.muted" ]] && target="${REMINDER_FILE}.muted"
+    > "$target"
+    echo "Reminders cleared"
+}
+
+mute_reminders() {
+    if [[ -f "${REMINDER_FILE}.muted" ]]; then
+        printf '%s\n\n' "🔕 Reminders already muted"; return
+    fi
+    backup_file || true
+    mv "$REMINDER_FILE" "${REMINDER_FILE}.muted"
+    printf '%s\n\n' "🔕 Reminders muted"
+}
+
+activate_reminders() {
+    if [[ ! -f "${REMINDER_FILE}.muted" ]]; then
+        printf '%s\n\n' "🔔 Reminders already active"; return
+    fi
+    backup_file || true
+    mv "${REMINDER_FILE}.muted" "$REMINDER_FILE"
+    printf '%s\n\n' "🔔 Reminders activated"
+}
+
+print_help() {
+    print_state
+    echo "Usage: nag add <msg> | delete <pattern> | list | clear | mute | activate | undo"
+    echo "Short forms: a | d | l | c | m | act | u"
+    # Show absolute path to this script
+    printf 'Script path: %s\n' "$(realpath "${BASH_SOURCE[0]}")"
+}
+
+# -----------------------------------------------------------------------------#
+#  DISPATCH
+# -----------------------------------------------------------------------------#
+case "${1:-}" in
+  add|a)          add_reminder   "$@"        ;;
+  list|l)         list_reminders             ;;
+  delete|d)       delete_reminder "$2"       ;;
+  clear|c)        clear_reminders            ;;
+  mute|m)         mute_reminders             ;;
+  activate|act)   activate_reminders         ;;
+  undo|u)         undo_last                  ;;
+  help|h|*)       print_help                 ;;
+esac
